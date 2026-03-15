@@ -8,6 +8,22 @@ const ICE_SERVERS: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    // Open TURN relay for NAT traversal (free, best-effort)
+    {
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
   ],
 };
 
@@ -81,11 +97,18 @@ export class Peer {
     this.events = events;
     this.pc = new RTCPeerConnection(ICE_SERVERS);
 
-    // Wait for ICE gathering to finish (timeout after 10s to avoid hanging)
+    // Wait for ICE gathering to finish (timeout after 15s to allow TURN relay candidates)
     this.iceDone = new Promise((resolve) => {
-      const timeout = setTimeout(() => resolve(), 10000);
+      const timeout = setTimeout(() => {
+        console.log("[tbdchat] ICE gathering timed out, proceeding with gathered candidates");
+        resolve();
+      }, 15000);
       this.pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          console.log("[tbdchat] ICE candidate:", e.candidate.type, e.candidate.protocol);
+        }
         if (e.candidate === null) {
+          console.log("[tbdchat] ICE gathering complete");
           clearTimeout(timeout);
           resolve();
         }
@@ -93,6 +116,7 @@ export class Peer {
     });
 
     this.pc.onconnectionstatechange = () => {
+      console.log("[tbdchat] connection state:", this.pc.connectionState);
       if (this.pc.connectionState === "connected") {
         this.events.onConnected();
       }
@@ -103,6 +127,14 @@ export class Peer {
       ) {
         this.events.onDisconnected();
       }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      console.log("[tbdchat] ICE connection state:", this.pc.iceConnectionState);
+    };
+
+    this.pc.onicegatheringstatechange = () => {
+      console.log("[tbdchat] ICE gathering state:", this.pc.iceGatheringState);
     };
 
     // Handle incoming data channel (answerer side)
