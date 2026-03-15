@@ -18,6 +18,8 @@ export type DCMessage =
   | { type: "call-start" }
   | { type: "call-accept" }
   | { type: "call-end" }
+  | { type: "screen-start" }
+  | { type: "screen-stop" }
   | { type: "_renego-offer"; sdp: RTCSessionDescriptionInit }
   | { type: "_renego-answer"; sdp: RTCSessionDescriptionInit };
 
@@ -30,6 +32,9 @@ export type PeerEvents = {
   onCallStart?: () => void;
   onCallAccept?: () => void;
   onCallEnd?: () => void;
+  onScreenStart?: () => void;
+  onScreenStop?: () => void;
+  onRemoteStream?: (stream: MediaStream | null) => void;
 };
 
 export class Peer {
@@ -43,6 +48,11 @@ export class Peer {
   private localStream: MediaStream | null = null;
   private remoteAudio: HTMLAudioElement | null = null;
   private senders: RTCRtpSender[] = [];
+
+  // Screen share state
+  private screenStream: MediaStream | null = null;
+  private screenSenders: RTCRtpSender[] = [];
+  private remoteVideoStream: MediaStream | null = null;
 
   constructor(events: PeerEvents) {
     this.events = events;
@@ -78,7 +88,7 @@ export class Peer {
       this.setupChannel();
     };
 
-    // Handle incoming remote audio tracks
+    // Handle incoming remote tracks (audio for calls, video for screen share)
     this.pc.ontrack = (e) => {
       if (e.track.kind === "audio") {
         if (!this.remoteAudio) {
@@ -86,6 +96,9 @@ export class Peer {
           this.remoteAudio.autoplay = true;
         }
         this.remoteAudio.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+      } else if (e.track.kind === "video") {
+        this.remoteVideoStream = e.streams[0] ?? new MediaStream([e.track]);
+        this.events.onRemoteStream?.(this.remoteVideoStream);
       }
     };
   }
@@ -146,6 +159,14 @@ export class Peer {
         case "call-end":
           this.cleanupCall();
           this.events.onCallEnd?.();
+          break;
+        case "screen-start":
+          this.events.onScreenStart?.();
+          break;
+        case "screen-stop":
+          this.remoteVideoStream = null;
+          this.events.onRemoteStream?.(null);
+          this.events.onScreenStop?.();
           break;
         case "_renego-offer":
           this.handleRenegoOffer(parsed.sdp as RTCSessionDescriptionInit);
@@ -309,9 +330,91 @@ export class Peer {
     }
   }
 
+  // ─── Screen share methods ─────────────────────────────────────────
+
+  /**
+   * Start sharing the screen.
+   * Calls getDisplayMedia, adds video+audio tracks, renegotiates, signals remote.
+   */
+  async startScreenShare(): Promise<void> {
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+    });
+    this.screenStream = stream;
+
+    for (const track of stream.getTracks()) {
+      const sender = this.pc.addTrack(track, stream);
+      this.screenSenders.push(sender);
+
+      // Auto-cleanup when user clicks browser's "Stop sharing" button
+      track.addEventListener("ended", () => {
+        if (this.screenStream) {
+          this.stopScreenShare();
+          this.events.onScreenStop?.();
+        }
+      });
+    }
+
+    await this.renegotiate();
+    this.sendDC({ type: "screen-start" });
+  }
+
+  /**
+   * Stop sharing the screen.
+   * Removes tracks, stops the stream, notifies remote.
+   */
+  stopScreenShare(): void {
+    for (const sender of this.screenSenders) {
+      try {
+        this.pc.removeTrack(sender);
+      } catch {
+        // Ignore if already removed
+      }
+    }
+    this.screenSenders = [];
+
+    if (this.screenStream) {
+      for (const track of this.screenStream.getTracks()) {
+        track.stop();
+      }
+      this.screenStream = null;
+    }
+
+    this.renegotiate().catch(console.error);
+    this.sendDC({ type: "screen-stop" });
+  }
+
+  /** Whether we are currently sharing our screen. */
+  get isScreenSharing(): boolean {
+    return this.screenStream !== null;
+  }
+
+  /** Clean up screen share resources (does NOT send screen-stop signal). */
+  private cleanupScreenShare(): void {
+    for (const sender of this.screenSenders) {
+      try {
+        this.pc.removeTrack(sender);
+      } catch {
+        // Ignore
+      }
+    }
+    this.screenSenders = [];
+
+    if (this.screenStream) {
+      for (const track of this.screenStream.getTracks()) {
+        track.stop();
+      }
+      this.screenStream = null;
+    }
+
+    this.remoteVideoStream = null;
+  }
+
   /** Clean up everything. */
   destroy() {
     this.cleanupCall();
+    this.cleanupScreenShare();
     this.dc?.close();
     this.pc.close();
   }

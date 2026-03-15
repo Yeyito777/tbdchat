@@ -34,6 +34,11 @@ export default function App() {
   const [callError, setCallError] = useState<string | null>(null);
   const callTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Screen share state
+  const [screenSharing, setScreenSharing] = useState(false);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+
   const peerRef = useRef<Peer | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -49,6 +54,13 @@ export default function App() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Attach remote video stream to video element
+  useEffect(() => {
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream;
+    }
+  }, [remoteStream]);
 
   // Call duration timer
   useEffect(() => {
@@ -89,6 +101,11 @@ export default function App() {
     setCallDuration(0);
   }
 
+  function resetScreenState() {
+    setScreenSharing(false);
+    setRemoteStream(null);
+  }
+
   function makePeer() {
     const peer = new Peer({
       onMessage: (text) =>
@@ -100,6 +117,7 @@ export default function App() {
         setRemoteShortId(null);
         setShowSavePrompt(false);
         resetCallState();
+        resetScreenState();
         peerRef.current = null;
       },
       onChannelOpen: () => {
@@ -120,6 +138,16 @@ export default function App() {
       },
       onCallEnd: () => {
         resetCallState();
+      },
+      onScreenStart: () => {
+        // Remote peer started sharing — stream arrives via onRemoteStream
+      },
+      onScreenStop: () => {
+        setScreenSharing(false);
+        setRemoteStream(null);
+      },
+      onRemoteStream: (stream) => {
+        setRemoteStream(stream);
       },
     });
     peer.setLocalShortId(getShortId());
@@ -205,6 +233,7 @@ export default function App() {
       setRemoteShortId(null);
       setShowSavePrompt(false);
       resetCallState();
+      resetScreenState();
     } else {
       setStage("home");
       setOfferText("");
@@ -259,6 +288,24 @@ export default function App() {
     if (!peerRef.current) return;
     const nowMuted = peerRef.current.toggleMute();
     setMuted(nowMuted);
+  }
+
+  // --- SCREEN SHARE ACTIONS ---
+  async function handleStartScreenShare() {
+    if (!peerRef.current || screenSharing) return;
+    try {
+      await peerRef.current.startScreenShare();
+      setScreenSharing(true);
+    } catch (err) {
+      // User cancelled or browser denied — not an error worth persisting
+      console.warn("Screen share failed:", err);
+    }
+  }
+
+  function handleStopScreenShare() {
+    if (!peerRef.current) return;
+    peerRef.current.stopScreenShare();
+    setScreenSharing(false);
   }
 
   function formatDuration(seconds: number): string {
@@ -492,6 +539,23 @@ export default function App() {
           <span style={{ flex: 1 }}>
             Connected — {peerLabel}
           </span>
+          {screenSharing ? (
+            <button
+              style={{ ...s.callBtn, background: "#ef4444", borderColor: "#ef4444", color: "white" }}
+              onClick={handleStopScreenShare}
+              title="Stop screen share"
+            >
+              🖥️ Stop
+            </button>
+          ) : (
+            <button
+              style={s.callBtn}
+              onClick={handleStartScreenShare}
+              title="Share screen"
+            >
+              🖥️
+            </button>
+          )}
           {callState === "idle" && (
             <button
               style={s.callBtn}
@@ -527,6 +591,16 @@ export default function App() {
             >
               Dismiss
             </button>
+          </div>
+        )}
+        {remoteStream && (
+          <div style={s.screenShareContainer}>
+            <video
+              ref={remoteVideoRef}
+              autoPlay
+              playsInline
+              style={s.screenShareVideo}
+            />
           </div>
         )}
         <div style={s.chatMessages}>
@@ -867,6 +941,20 @@ const s: Record<string, React.CSSProperties> = {
     fontSize: 13,
     width: 140,
     outline: "none",
+  },
+  screenShareContainer: {
+    background: "#000",
+    borderBottom: "1px solid #222",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    flexShrink: 0,
+  },
+  screenShareVideo: {
+    width: "100%",
+    maxHeight: "60vh",
+    background: "#000",
+    display: "block",
   },
   chatMessages: {
     flex: 1,
