@@ -7,6 +7,7 @@ import type { Friend } from "./friends";
 type Message = { from: "me" | "them"; text: string; ts: number };
 type Stage = "home" | "creating" | "create-waiting" | "join-waiting" | "chat";
 type SidebarView = "list" | "friend-detail";
+type CallState = "idle" | "calling" | "ringing" | "in-call";
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -25,6 +26,14 @@ export default function App() {
   const [showSavePrompt, setShowSavePrompt] = useState(false);
   const [friendName, setFriendName] = useState("");
   const [connectedPeerId, setConnectedPeerId] = useState<string | null>(null);
+
+  // Call state
+  const [callState, setCallState] = useState<CallState>("idle");
+  const [muted, setMuted] = useState(false);
+  const [callDuration, setCallDuration] = useState(0);
+  const [callError, setCallError] = useState<string | null>(null);
+  const callTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const peerRef = useRef<Peer | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -41,9 +50,44 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Call duration timer
+  useEffect(() => {
+    if (callState === "in-call") {
+      setCallDuration(0);
+      callTimerRef.current = setInterval(() => {
+        setCallDuration((d) => d + 1);
+      }, 1000);
+    } else {
+      if (callTimerRef.current) {
+        clearInterval(callTimerRef.current);
+        callTimerRef.current = null;
+      }
+      setCallDuration(0);
+    }
+    return () => {
+      if (callTimerRef.current) {
+        clearInterval(callTimerRef.current);
+        callTimerRef.current = null;
+      }
+    };
+  }, [callState]);
+
+  // Clear call error after 4 seconds
+  useEffect(() => {
+    if (!callError) return;
+    const t = setTimeout(() => setCallError(null), 4000);
+    return () => clearTimeout(t);
+  }, [callError]);
+
   const refreshFriends = useCallback(() => {
     setFriends(getFriends());
   }, []);
+
+  function resetCallState() {
+    setCallState("idle");
+    setMuted(false);
+    setCallDuration(0);
+  }
 
   function makePeer() {
     const peer = new Peer({
@@ -55,6 +99,7 @@ export default function App() {
         setConnectedPeerId(null);
         setRemoteShortId(null);
         setShowSavePrompt(false);
+        resetCallState();
         peerRef.current = null;
       },
       onChannelOpen: () => {
@@ -63,10 +108,18 @@ export default function App() {
       onIdentity: (id) => {
         setRemoteShortId(id);
         setConnectedPeerId(id);
-        // If not already a friend, prompt to save
         if (!getFriend(id)) {
           setShowSavePrompt(true);
         }
+      },
+      onCallStart: () => {
+        setCallState("ringing");
+      },
+      onCallAccept: () => {
+        setCallState("in-call");
+      },
+      onCallEnd: () => {
+        resetCallState();
       },
     });
     peer.setLocalShortId(getShortId());
@@ -151,12 +204,67 @@ export default function App() {
       setConnectedPeerId(null);
       setRemoteShortId(null);
       setShowSavePrompt(false);
+      resetCallState();
     } else {
       setStage("home");
       setOfferText("");
       setAnswerText("");
       setPasteText("");
     }
+  }
+
+  // --- CALL ACTIONS ---
+  async function handleStartCall() {
+    if (!peerRef.current || callState !== "idle") return;
+    setCallState("calling");
+    setCallError(null);
+    try {
+      await peerRef.current.startCall();
+    } catch (err) {
+      setCallState("idle");
+      setCallError(
+        err instanceof Error ? err.message : "Could not access microphone"
+      );
+    }
+  }
+
+  async function handleAcceptCall() {
+    if (!peerRef.current || callState !== "ringing") return;
+    setCallError(null);
+    try {
+      await peerRef.current.acceptCall();
+      setCallState("in-call");
+    } catch (err) {
+      setCallState("idle");
+      peerRef.current.rejectCall();
+      setCallError(
+        err instanceof Error ? err.message : "Could not access microphone"
+      );
+    }
+  }
+
+  function handleRejectCall() {
+    if (!peerRef.current) return;
+    peerRef.current.rejectCall();
+    resetCallState();
+  }
+
+  function handleHangUp() {
+    if (!peerRef.current) return;
+    peerRef.current.endCall();
+    resetCallState();
+  }
+
+  function handleToggleMute() {
+    if (!peerRef.current) return;
+    const nowMuted = peerRef.current.toggleMute();
+    setMuted(nowMuted);
+  }
+
+  function formatDuration(seconds: number): string {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, "0")}`;
   }
 
   if (!ready) return null;
@@ -208,6 +316,56 @@ export default function App() {
       </div>
     </div>
   );
+
+  // --- CALL BAR (shown below chat header) ---
+  const peerLabel = remoteShortId
+    ? getFriend(remoteShortId)?.name ?? remoteShortId
+    : "Peer";
+
+  let callBar: React.ReactNode = null;
+  if (stage === "chat" && callState === "calling") {
+    callBar = (
+      <div style={s.callBar}>
+        <span style={s.callBarText}>📞 Calling {peerLabel}...</span>
+        <button style={s.hangUpBtn} onClick={handleHangUp}>
+          Hang up
+        </button>
+      </div>
+    );
+  } else if (stage === "chat" && callState === "ringing") {
+    callBar = (
+      <div style={s.callBar}>
+        <span style={s.callBarText}>📞 Incoming call from {peerLabel}</span>
+        <button style={s.acceptCallBtn} onClick={handleAcceptCall}>
+          Accept
+        </button>
+        <button style={s.hangUpBtn} onClick={handleRejectCall}>
+          Reject
+        </button>
+      </div>
+    );
+  } else if (stage === "chat" && callState === "in-call") {
+    callBar = (
+      <div style={s.callBarActive}>
+        <span style={s.callBarText}>
+          📞 In call — {formatDuration(callDuration)}
+        </span>
+        <div style={s.callBarActions}>
+          <button style={s.muteBtn} onClick={handleToggleMute}>
+            {muted ? "🔇" : "🔊"}
+          </button>
+          <button style={s.hangUpBtn} onClick={handleHangUp}>
+            Hang up
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // --- CALL ERROR ---
+  const callErrorBar = callError ? (
+    <div style={s.callErrorBar}>⚠️ {callError}</div>
+  ) : null;
 
   // --- MAIN CONTENT ---
   let mainContent: React.ReactNode;
@@ -327,17 +485,25 @@ export default function App() {
     );
   } else {
     // stage === "chat"
-    const peerLabel = remoteShortId
-      ? getFriend(remoteShortId)?.name ?? remoteShortId
-      : "Peer";
     mainContent = (
       <div style={s.chatContainer}>
         <div style={s.chatHeader}>
           <span style={s.onlineDot} />
-          <span>
+          <span style={{ flex: 1 }}>
             Connected — {peerLabel}
           </span>
+          {callState === "idle" && (
+            <button
+              style={s.callBtn}
+              onClick={handleStartCall}
+              title="Start voice call"
+            >
+              📞
+            </button>
+          )}
         </div>
+        {callBar}
+        {callErrorBar}
         {showSavePrompt && (
           <div style={s.savePrompt}>
             <span style={s.savePromptText}>
@@ -604,6 +770,80 @@ const s: Record<string, React.CSSProperties> = {
     height: 8,
     borderRadius: "50%",
     background: "#22c55e",
+  },
+  callBtn: {
+    background: "none",
+    border: "1px solid #333",
+    borderRadius: 6,
+    padding: "4px 10px",
+    cursor: "pointer",
+    fontSize: 16,
+    lineHeight: 1,
+    transition: "background 0.15s",
+  },
+  // Call bar states
+  callBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "8px 16px",
+    background: "#1a1a2e",
+    borderBottom: "1px solid #222",
+    fontSize: 13,
+  },
+  callBarActive: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "8px 16px",
+    background: "#0f2a1a",
+    borderBottom: "1px solid #1a4a2a",
+    fontSize: 13,
+  },
+  callBarText: {
+    color: "#ccc",
+    flex: 1,
+  },
+  callBarActions: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+  },
+  muteBtn: {
+    background: "#333",
+    border: "none",
+    borderRadius: 6,
+    padding: "5px 12px",
+    cursor: "pointer",
+    fontSize: 15,
+    lineHeight: 1,
+  },
+  hangUpBtn: {
+    background: "#ef4444",
+    color: "white",
+    border: "none",
+    borderRadius: 6,
+    padding: "5px 14px",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  acceptCallBtn: {
+    background: "#22c55e",
+    color: "white",
+    border: "none",
+    borderRadius: 6,
+    padding: "5px 14px",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  callErrorBar: {
+    padding: "6px 16px",
+    background: "#2a1a1a",
+    borderBottom: "1px solid #442222",
+    fontSize: 13,
+    color: "#f87171",
   },
   savePrompt: {
     display: "flex",
