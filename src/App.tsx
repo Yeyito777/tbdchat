@@ -1,10 +1,16 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Peer } from "./peer";
+import { initIdentity, getShortId } from "./identity";
+import { getFriends, addFriend, removeFriend, getFriend } from "./friends";
+import type { Friend } from "./friends";
 
 type Message = { from: "me" | "them"; text: string; ts: number };
-type Stage = "home" | "create-waiting" | "join-waiting" | "chat";
+type Stage = "home" | "creating" | "create-waiting" | "join-waiting" | "chat";
+type SidebarView = "list" | "friend-detail";
 
 export default function App() {
+  const [ready, setReady] = useState(false);
+  const [shortId, setShortId] = useState("");
   const [stage, setStage] = useState<Stage>("home");
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -12,12 +18,32 @@ export default function App() {
   const [pasteText, setPasteText] = useState("");
   const [answerText, setAnswerText] = useState("");
   const [copied, setCopied] = useState(false);
+  const [friends, setFriends] = useState<Friend[]>([]);
+  const [sidebarView, setSidebarView] = useState<SidebarView>("list");
+  const [selectedFriendId, setSelectedFriendId] = useState<string | null>(null);
+  const [remoteShortId, setRemoteShortId] = useState<string | null>(null);
+  const [showSavePrompt, setShowSavePrompt] = useState(false);
+  const [friendName, setFriendName] = useState("");
+  const [connectedPeerId, setConnectedPeerId] = useState<string | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Init identity on mount
+  useEffect(() => {
+    initIdentity().then((id) => {
+      setShortId(id.shortId);
+      setFriends(getFriends());
+      setReady(true);
+    });
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  const refreshFriends = useCallback(() => {
+    setFriends(getFriends());
+  }, []);
 
   function makePeer() {
     const peer = new Peer({
@@ -26,19 +52,34 @@ export default function App() {
       onConnected: () => setStage("chat"),
       onDisconnected: () => {
         setStage("home");
+        setConnectedPeerId(null);
+        setRemoteShortId(null);
+        setShowSavePrompt(false);
         peerRef.current = null;
       },
+      onChannelOpen: () => {
+        // channel is open
+      },
+      onIdentity: (id) => {
+        setRemoteShortId(id);
+        setConnectedPeerId(id);
+        // If not already a friend, prompt to save
+        if (!getFriend(id)) {
+          setShowSavePrompt(true);
+        }
+      },
     });
+    peer.setLocalShortId(getShortId());
     peerRef.current = peer;
     return peer;
   }
 
   // --- CALLER FLOW ---
   async function handleCreate() {
+    setStage("creating");
     const peer = makePeer();
     const offer = await peer.createOffer();
     setOfferText(offer);
-    (window as any).__tbdOffer = offer;
     setStage("create-waiting");
   }
 
@@ -54,7 +95,6 @@ export default function App() {
     const peer = makePeer();
     const answer = await peer.acceptOffer(pasteText.trim());
     setAnswerText(answer);
-    (window as any).__tbdAnswer = answer;
     setPasteText("");
     setStage("join-waiting");
   }
@@ -73,53 +113,193 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   }
 
-  // --- RENDER ---
-  if (stage === "home") {
-    return (
-      <div style={styles.container}>
-        <h1 style={styles.title}>tbdchat</h1>
-        <p style={styles.subtitle}>P2P chat. No servers. No bullshit.</p>
-        <div style={styles.homeButtons}>
-          <button style={styles.btn} onClick={handleCreate}>
+  function handleSaveFriend() {
+    if (!remoteShortId || !friendName.trim()) return;
+    addFriend({
+      id: remoteShortId,
+      name: friendName.trim(),
+      publicKey: "",
+      addedAt: Date.now(),
+    });
+    refreshFriends();
+    setShowSavePrompt(false);
+    setFriendName("");
+  }
+
+  function handleRemoveFriend(id: string) {
+    removeFriend(id);
+    refreshFriends();
+    if (selectedFriendId === id) {
+      setSidebarView("list");
+      setSelectedFriendId(null);
+    }
+  }
+
+  function handleFriendClick(id: string) {
+    setSelectedFriendId(id);
+    setSidebarView("friend-detail");
+  }
+
+  function handleNewChat() {
+    setSidebarView("list");
+    setSelectedFriendId(null);
+    if (stage === "chat") {
+      peerRef.current?.destroy();
+      peerRef.current = null;
+      setStage("home");
+      setMessages([]);
+      setConnectedPeerId(null);
+      setRemoteShortId(null);
+      setShowSavePrompt(false);
+    } else {
+      setStage("home");
+      setOfferText("");
+      setAnswerText("");
+      setPasteText("");
+    }
+  }
+
+  if (!ready) return null;
+
+  const selectedFriend = selectedFriendId ? getFriend(selectedFriendId) : null;
+
+  // --- SIDEBAR ---
+  const sidebar = (
+    <div style={s.sidebar}>
+      <div style={s.sidebarHeader}>
+        <div style={s.sidebarTitle}>tbdchat</div>
+        <div style={s.yourId}>
+          <span style={s.idLabel}>You:</span>{" "}
+          <span style={s.idValue}>{shortId}</span>
+        </div>
+      </div>
+      <button style={s.newChatBtn} onClick={handleNewChat}>
+        + New Chat
+      </button>
+      <div style={s.friendList}>
+        {friends.length === 0 && (
+          <div style={s.emptyFriends}>No friends yet</div>
+        )}
+        {friends.map((f) => {
+          const isOnline = connectedPeerId === f.id;
+          const isSelected = selectedFriendId === f.id;
+          return (
+            <div
+              key={f.id}
+              style={{
+                ...s.friendItem,
+                background: isSelected ? "#222" : "transparent",
+              }}
+              onClick={() => handleFriendClick(f.id)}
+            >
+              <span
+                style={{
+                  ...s.statusDot,
+                  background: isOnline ? "#22c55e" : "#555",
+                }}
+              />
+              <div style={s.friendInfo}>
+                <div style={s.friendName}>{f.name}</div>
+                <div style={s.friendId}>{f.id}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  // --- MAIN CONTENT ---
+  let mainContent: React.ReactNode;
+
+  if (sidebarView === "friend-detail" && selectedFriend) {
+    const isOnline = connectedPeerId === selectedFriend.id;
+    mainContent = (
+      <div style={s.mainCenter}>
+        <div style={s.friendDetailCard}>
+          <div style={s.friendDetailName}>{selectedFriend.name}</div>
+          <div style={s.friendDetailId}>ID: {selectedFriend.id}</div>
+          <div style={s.friendDetailStatus}>
+            <span
+              style={{
+                ...s.statusDot,
+                background: isOnline ? "#22c55e" : "#555",
+              }}
+            />
+            {isOnline ? "Online" : "Offline"}
+          </div>
+          <div style={s.friendDetailDate}>
+            Added {new Date(selectedFriend.addedAt).toLocaleDateString()}
+          </div>
+          <button
+            style={s.removeFriendBtn}
+            onClick={() => handleRemoveFriend(selectedFriend.id)}
+          >
+            Remove Friend
+          </button>
+        </div>
+      </div>
+    );
+  } else if (stage === "creating") {
+    mainContent = (
+      <div style={s.mainCenter}>
+        <h1 style={s.title}>tbdchat</h1>
+        <p style={s.subtitle}>Generating invite code...</p>
+        <div style={{ color: "#888", fontSize: 13 }}>Gathering network info, this may take a few seconds</div>
+      </div>
+    );
+  } else if (stage === "home") {
+    mainContent = (
+      <div style={s.mainCenter}>
+        <h1 style={s.title}>tbdchat</h1>
+        <p style={s.subtitle}>P2P chat. No servers. No bullshit.</p>
+        <div style={s.homeButtons}>
+          <button style={s.btn} onClick={handleCreate}>
             Create invite
           </button>
-          <div style={styles.divider}>or join with a code</div>
+          <div style={s.divider}>or join with a code</div>
           <textarea
-            style={styles.textarea}
+            style={s.textarea}
             placeholder="Paste invite code here..."
             value={pasteText}
             onChange={(e) => setPasteText(e.target.value)}
           />
-          <button style={styles.btn} onClick={handleJoin} disabled={!pasteText.trim()}>
+          <button
+            style={s.btn}
+            onClick={handleJoin}
+            disabled={!pasteText.trim()}
+          >
             Join
           </button>
         </div>
       </div>
     );
-  }
-
-  if (stage === "create-waiting") {
-    return (
-      <div style={styles.container}>
-        <h1 style={styles.title}>tbdchat</h1>
-        <p style={styles.subtitle}>Step 1: Send this invite code to your friend</p>
-        <div style={styles.codeBox}>
-          <code style={styles.code} data-full={offerText}>{offerText.slice(0, 80)}...</code>
-          <button style={styles.btnSmall} onClick={() => copyToClipboard(offerText)}>
+  } else if (stage === "create-waiting") {
+    mainContent = (
+      <div style={s.mainCenter}>
+        <h1 style={s.title}>tbdchat</h1>
+        <p style={s.subtitle}>Step 1: Send this invite code to your friend</p>
+        <div style={s.codeBox}>
+          <code style={s.code} id="offer-full">{offerText.slice(0, 80)}...</code>
+          <input type="hidden" id="offer-data" value={offerText} />
+          <button
+            style={s.btnSmall}
+            onClick={() => copyToClipboard(offerText)}
+          >
             {copied ? "Copied!" : "Copy"}
           </button>
         </div>
-        <p style={{ ...styles.subtitle, marginTop: 32 }}>
+        <p style={{ ...s.subtitle, marginTop: 32 }}>
           Step 2: Paste their response code
         </p>
         <textarea
-          style={styles.textarea}
+          style={s.textarea}
           placeholder="Paste their response code here..."
           value={pasteText}
           onChange={(e) => setPasteText(e.target.value)}
         />
         <button
-          style={styles.btn}
+          style={s.btn}
           onClick={handleAcceptAnswer}
           disabled={!pasteText.trim()}
         >
@@ -127,73 +307,202 @@ export default function App() {
         </button>
       </div>
     );
-  }
-
-  if (stage === "join-waiting") {
-    return (
-      <div style={styles.container}>
-        <h1 style={styles.title}>tbdchat</h1>
-        <p style={styles.subtitle}>
-          Send this response code back to your friend
-        </p>
-        <div style={styles.codeBox}>
-          <code style={styles.code} data-full={answerText}>{answerText.slice(0, 80)}...</code>
-          <button style={styles.btnSmall} onClick={() => copyToClipboard(answerText)}>
+  } else if (stage === "join-waiting") {
+    mainContent = (
+      <div style={s.mainCenter}>
+        <h1 style={s.title}>tbdchat</h1>
+        <p style={s.subtitle}>Send this response code back to your friend</p>
+        <div style={s.codeBox}>
+          <code style={s.code}>{answerText.slice(0, 80)}...</code>
+          <input type="hidden" id="answer-data" value={answerText} />
+          <button
+            style={s.btnSmall}
+            onClick={() => copyToClipboard(answerText)}
+          >
             {copied ? "Copied!" : "Copy"}
           </button>
         </div>
-        <p style={styles.subtitle}>Waiting for connection...</p>
+        <p style={s.subtitle}>Waiting for connection...</p>
+      </div>
+    );
+  } else {
+    // stage === "chat"
+    const peerLabel = remoteShortId
+      ? getFriend(remoteShortId)?.name ?? remoteShortId
+      : "Peer";
+    mainContent = (
+      <div style={s.chatContainer}>
+        <div style={s.chatHeader}>
+          <span style={s.onlineDot} />
+          <span>
+            Connected — {peerLabel}
+          </span>
+        </div>
+        {showSavePrompt && (
+          <div style={s.savePrompt}>
+            <span style={s.savePromptText}>
+              Save <b>{remoteShortId}</b> as friend?
+            </span>
+            <input
+              style={s.saveNameInput}
+              placeholder="Enter a name..."
+              value={friendName}
+              onChange={(e) => setFriendName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleSaveFriend();
+              }}
+            />
+            <button style={s.btnSmall} onClick={handleSaveFriend}>
+              Save
+            </button>
+            <button
+              style={s.btnSmall}
+              onClick={() => setShowSavePrompt(false)}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+        <div style={s.chatMessages}>
+          {messages.map((m, i) => (
+            <div
+              key={i}
+              style={{
+                ...s.bubble,
+                alignSelf: m.from === "me" ? "flex-end" : "flex-start",
+                background: m.from === "me" ? "#2563eb" : "#262626",
+              }}
+            >
+              {m.text}
+            </div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
+        <form
+          style={s.chatInput}
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSend();
+          }}
+        >
+          <input
+            style={s.input}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Type a message..."
+            autoFocus
+          />
+          <button style={s.sendBtn} type="submit">
+            Send
+          </button>
+        </form>
       </div>
     );
   }
 
-  // stage === "chat"
   return (
-    <div style={styles.chatContainer}>
-      <div style={styles.chatHeader}>
-        <span style={styles.dot} />
-        <span>Connected — P2P</span>
-      </div>
-      <div style={styles.chatMessages}>
-        {messages.map((m, i) => (
-          <div
-            key={i}
-            style={{
-              ...styles.bubble,
-              alignSelf: m.from === "me" ? "flex-end" : "flex-start",
-              background: m.from === "me" ? "#2563eb" : "#262626",
-            }}
-          >
-            {m.text}
-          </div>
-        ))}
-        <div ref={bottomRef} />
-      </div>
-      <form
-        style={styles.chatInput}
-        onSubmit={(e) => {
-          e.preventDefault();
-          handleSend();
-        }}
-      >
-        <input
-          style={styles.input}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Type a message..."
-          autoFocus
-        />
-        <button style={styles.sendBtn} type="submit">
-          Send
-        </button>
-      </form>
+    <div style={s.layout}>
+      {sidebar}
+      <div style={s.main}>{mainContent}</div>
     </div>
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  container: {
+const s: Record<string, React.CSSProperties> = {
+  layout: {
+    display: "flex",
     height: "100%",
+  },
+  sidebar: {
+    width: 220,
+    flexShrink: 0,
+    background: "#161616",
+    borderRight: "1px solid #222",
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+  },
+  sidebarHeader: {
+    padding: "16px 14px 8px",
+    borderBottom: "1px solid #222",
+  },
+  sidebarTitle: {
+    fontSize: 20,
+    fontWeight: 700,
+    letterSpacing: -1,
+  },
+  yourId: {
+    fontSize: 12,
+    marginTop: 4,
+    color: "#888",
+  },
+  idLabel: {
+    color: "#666",
+  },
+  idValue: {
+    color: "#2563eb",
+    fontFamily: "monospace",
+    fontWeight: 600,
+  },
+  newChatBtn: {
+    margin: "10px 10px 4px",
+    padding: "8px 0",
+    background: "#2563eb",
+    color: "white",
+    border: "none",
+    borderRadius: 6,
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  friendList: {
+    flex: 1,
+    overflowY: "auto",
+    padding: "6px 0",
+  },
+  emptyFriends: {
+    padding: "20px 14px",
+    color: "#555",
+    fontSize: 13,
+    textAlign: "center",
+  },
+  friendItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 14px",
+    cursor: "pointer",
+    transition: "background 0.1s",
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: "50%",
+    flexShrink: 0,
+  },
+  friendInfo: {
+    minWidth: 0,
+  },
+  friendName: {
+    fontSize: 14,
+    fontWeight: 500,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  friendId: {
+    fontSize: 11,
+    color: "#666",
+    fontFamily: "monospace",
+  },
+  main: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+  },
+  mainCenter: {
+    flex: 1,
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
@@ -246,6 +555,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   textarea: {
     width: "100%",
+    maxWidth: 400,
     minHeight: 80,
     padding: 12,
     background: "#161616",
@@ -289,11 +599,34 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 14,
     fontWeight: 600,
   },
-  dot: {
+  onlineDot: {
     width: 8,
     height: 8,
     borderRadius: "50%",
     background: "#22c55e",
+  },
+  savePrompt: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 16px",
+    background: "#1a1a2e",
+    borderBottom: "1px solid #222",
+    fontSize: 13,
+  },
+  savePromptText: {
+    color: "#aaa",
+    whiteSpace: "nowrap",
+  },
+  saveNameInput: {
+    padding: "4px 8px",
+    background: "#111",
+    color: "#e0e0e0",
+    border: "1px solid #333",
+    borderRadius: 4,
+    fontSize: 13,
+    width: 140,
+    outline: "none",
   },
   chatMessages: {
     flex: 1,
@@ -335,6 +668,47 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 8,
     fontSize: 15,
     fontWeight: 600,
+    cursor: "pointer",
+  },
+  friendDetailCard: {
+    background: "#161616",
+    border: "1px solid #222",
+    borderRadius: 12,
+    padding: 32,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 12,
+    minWidth: 280,
+  },
+  friendDetailName: {
+    fontSize: 24,
+    fontWeight: 700,
+  },
+  friendDetailId: {
+    fontSize: 13,
+    color: "#666",
+    fontFamily: "monospace",
+  },
+  friendDetailStatus: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 14,
+    color: "#aaa",
+  },
+  friendDetailDate: {
+    fontSize: 12,
+    color: "#555",
+  },
+  removeFriendBtn: {
+    marginTop: 12,
+    padding: "8px 20px",
+    background: "#331111",
+    color: "#f87171",
+    border: "1px solid #552222",
+    borderRadius: 6,
+    fontSize: 13,
     cursor: "pointer",
   },
 };

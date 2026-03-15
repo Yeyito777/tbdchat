@@ -1,6 +1,6 @@
 /**
  * Minimal WebRTC peer connection manager.
- * Handles offer/answer exchange and DataChannel messaging.
+ * Handles offer/answer exchange, DataChannel messaging, and identity exchange.
  */
 
 const ICE_SERVERS: RTCConfiguration = {
@@ -14,6 +14,8 @@ export type PeerEvents = {
   onMessage: (msg: string) => void;
   onConnected: () => void;
   onDisconnected: () => void;
+  onChannelOpen?: () => void;
+  onIdentity?: (shortId: string) => void;
 };
 
 export class Peer {
@@ -21,15 +23,20 @@ export class Peer {
   dc: RTCDataChannel | null = null;
   private events: PeerEvents;
   private iceDone: Promise<void>;
+  private _localShortId: string | null = null;
 
   constructor(events: PeerEvents) {
     this.events = events;
     this.pc = new RTCPeerConnection(ICE_SERVERS);
 
-    // Wait for ICE gathering to finish before we expose the offer/answer
+    // Wait for ICE gathering to finish (timeout after 10s to avoid hanging)
     this.iceDone = new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(), 10000);
       this.pc.onicecandidate = (e) => {
-        if (e.candidate === null) resolve();
+        if (e.candidate === null) {
+          clearTimeout(timeout);
+          resolve();
+        }
       };
     });
 
@@ -53,9 +60,39 @@ export class Peer {
     };
   }
 
+  /** Set the local short ID to send on channel open. */
+  setLocalShortId(id: string) {
+    this._localShortId = id;
+  }
+
   private setupChannel() {
     if (!this.dc) return;
-    this.dc.onmessage = (e) => this.events.onMessage(e.data);
+    this.dc.onopen = () => {
+      this.events.onChannelOpen?.();
+      // Send identity message
+      if (this._localShortId) {
+        this.dc?.send(JSON.stringify({ type: "identity", shortId: this._localShortId }));
+      }
+    };
+    this.dc.onmessage = (e) => {
+      // Try to parse identity messages
+      try {
+        const parsed = JSON.parse(e.data) as unknown;
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          "type" in parsed &&
+          (parsed as Record<string, unknown>).type === "identity" &&
+          "shortId" in parsed
+        ) {
+          this.events.onIdentity?.((parsed as Record<string, unknown>).shortId as string);
+          return;
+        }
+      } catch {
+        // Not JSON, treat as regular message
+      }
+      this.events.onMessage(e.data);
+    };
   }
 
   /** Create an offer (caller side). Returns the offer string to share. */
