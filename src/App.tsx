@@ -103,12 +103,16 @@ export default function App() {
   const [fileProgress, setFileProgress] = useState<Map<string, { received: number; total: number }>>(new Map());
   const [dragging, setDragging] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const dragCounter = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const peerRef = useRef<Peer | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Keep a ref for connectedPeerId so the onMessage callback always reads latest
+  const connectedPeerIdRef = useRef<string | null>(null);
 
   // Init identity on mount
   useEffect(() => {
@@ -198,6 +202,18 @@ export default function App() {
     const t = setTimeout(() => setFileError(null), 4000);
     return () => clearTimeout(t);
   }, [fileError]);
+
+  // Clear connection error after 5 seconds
+  useEffect(() => {
+    if (!connectionError) return;
+    const t = setTimeout(() => setConnectionError(null), 5000);
+    return () => clearTimeout(t);
+  }, [connectionError]);
+
+  // Sync connectedPeerId ref
+  useEffect(() => {
+    connectedPeerIdRef.current = connectedPeerId;
+  }, [connectedPeerId]);
 
   const refreshFriends = useCallback(() => {
     setFriends(getFriends());
@@ -334,35 +350,47 @@ export default function App() {
     return peer;
   }
 
-  // Keep a ref for connectedPeerId so the onMessage callback always reads latest
-  const connectedPeerIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    connectedPeerIdRef.current = connectedPeerId;
-  }, [connectedPeerId]);
-
   // --- CALLER FLOW ---
   async function handleCreate() {
     setStage("creating");
-    const peer = makePeer();
-    const offer = await peer.createOffer();
-    setOfferText(offer);
-    setStage("create-waiting");
+    try {
+      const peer = makePeer();
+      const offer = await peer.createOffer();
+      setOfferText(offer);
+      setStage("create-waiting");
+    } catch {
+      setStage("home");
+      setConnectionError("Failed to create invite. Check your network connection.");
+      peerRef.current?.destroy();
+      peerRef.current = null;
+    }
   }
 
   async function handleAcceptAnswer() {
     if (!peerRef.current || !pasteText.trim()) return;
-    await peerRef.current.acceptAnswer(pasteText.trim());
-    setPasteText("");
+    try {
+      await peerRef.current.acceptAnswer(pasteText.trim());
+      setPasteText("");
+    } catch {
+      setConnectionError("Invalid response code. Make sure you copied it correctly.");
+    }
   }
 
   // --- JOINER FLOW ---
   async function handleJoin() {
     if (!pasteText.trim()) return;
-    const peer = makePeer();
-    const answer = await peer.acceptOffer(pasteText.trim());
-    setAnswerText(answer);
-    setPasteText("");
-    setStage("join-waiting");
+    try {
+      const peer = makePeer();
+      const answer = await peer.acceptOffer(pasteText.trim());
+      setAnswerText(answer);
+      setPasteText("");
+      setStage("join-waiting");
+    } catch {
+      setStage("home");
+      setConnectionError("Invalid invite code. Make sure you copied it correctly.");
+      peerRef.current?.destroy();
+      peerRef.current = null;
+    }
   }
 
   // --- CHAT ---
@@ -381,7 +409,17 @@ export default function App() {
   }
 
   function copyToClipboard(text: string) {
-    navigator.clipboard.writeText(text);
+    navigator.clipboard.writeText(text).catch(() => {
+      // Fallback: select a temporary textarea
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    });
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }
@@ -490,7 +528,9 @@ export default function App() {
       await peerRef.current.startScreenShare();
       setScreenSharing(true);
     } catch (err) {
-      console.warn("Screen share failed:", err);
+      if (err instanceof Error && err.name !== "NotAllowedError") {
+        setCallError("Screen sharing failed: " + err.message);
+      }
     }
   }
 
@@ -533,7 +573,6 @@ export default function App() {
     try {
       await peerRef.current.sendFile(file, fileId);
     } catch (err) {
-      console.error("File send failed:", err);
       setFileError(err instanceof Error ? err.message : "File send failed");
     }
 
@@ -886,6 +925,7 @@ export default function App() {
       <div style={s.mainCenter}>
         <h1 style={s.title}>tbdchat</h1>
         <p style={s.subtitle}>P2P chat. No servers. No bullshit.</p>
+        {connectionError && <div style={s.connectionErrorBar}>⚠️ {connectionError}</div>}
         <div style={s.homeButtons}>
           <button style={s.btn} onClick={handleCreate}>
             Create invite
@@ -912,9 +952,9 @@ export default function App() {
       <div style={s.mainCenter}>
         <h1 style={s.title}>tbdchat</h1>
         <p style={s.subtitle}>Step 1: Send this invite code to your friend</p>
+        {connectionError && <div style={s.connectionErrorBar}>⚠️ {connectionError}</div>}
         <div style={s.codeBox}>
-          <code style={s.code} id="offer-full">{offerText.slice(0, 80)}...</code>
-          <input type="hidden" id="offer-data" value={offerText} />
+          <code style={s.code}>{offerText.slice(0, 80)}...</code>
           <button
             style={s.btnSmall}
             onClick={() => copyToClipboard(offerText)}
@@ -947,7 +987,6 @@ export default function App() {
         <p style={s.subtitle}>Send this response code back to your friend</p>
         <div style={s.codeBox}>
           <code style={s.code}>{answerText.slice(0, 80)}...</code>
-          <input type="hidden" id="answer-data" value={answerText} />
           <button
             style={s.btnSmall}
             onClick={() => copyToClipboard(answerText)}
@@ -1400,6 +1439,17 @@ const s: Record<string, React.CSSProperties> = {
     borderBottom: "1px solid #442222",
     fontSize: 13,
     color: "#f87171",
+  },
+  connectionErrorBar: {
+    padding: "8px 16px",
+    background: "#2a1a1a",
+    border: "1px solid #442222",
+    borderRadius: 8,
+    fontSize: 13,
+    color: "#f87171",
+    maxWidth: 400,
+    width: "100%",
+    textAlign: "center",
   },
   savePrompt: {
     display: "flex",

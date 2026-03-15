@@ -207,25 +207,22 @@ export class Peer {
           this.handleRenegoOffer(parsed.sdp as RTCSessionDescriptionInit);
           break;
         case "_renego-answer":
-          this.pc.setRemoteDescription(parsed.sdp as RTCSessionDescriptionInit).catch(console.error);
+          this.pc.setRemoteDescription(parsed.sdp as RTCSessionDescriptionInit).catch(() => {
+            /* renegotiation answer failed — non-fatal */
+          });
           break;
 
         // ── File transfer protocol ────────────────────────
-        case "file-meta":
-          this._incomingFile = {
-            fileId: parsed.fileId as string,
-            name: parsed.name as string,
-            size: parsed.size as number,
-            chunks: [],
-            received: 0,
-          };
-          this.events.onFileStart?.({
-            name: parsed.name as string,
-            size: parsed.size as number,
-            fileId: parsed.fileId as string,
-          });
-          this.events.onFileProgress?.(parsed.fileId as string, 0, parsed.size as number);
+        case "file-meta": {
+          const name = parsed.name;
+          const size = parsed.size;
+          const fileId = parsed.fileId;
+          if (typeof name !== "string" || typeof size !== "number" || typeof fileId !== "string") break;
+          this._incomingFile = { fileId, name, size, chunks: [], received: 0 };
+          this.events.onFileStart?.({ name, size, fileId });
+          this.events.onFileProgress?.(fileId, 0, size);
           break;
+        }
         case "file-done":
           if (this._incomingFile && this._incomingFile.fileId === parsed.fileId) {
             const blob = new Blob(this._incomingFile.chunks);
@@ -292,7 +289,7 @@ export class Peer {
 
   /** Accept an offer and generate an answer (callee side). Returns answer string to share back. */
   async acceptOffer(offerStr: string): Promise<string> {
-    const offer = JSON.parse(atob(offerStr));
+    const offer = JSON.parse(atob(offerStr)) as RTCSessionDescriptionInit;
     await this.pc.setRemoteDescription(offer);
 
     const answer = await this.pc.createAnswer();
@@ -304,7 +301,7 @@ export class Peer {
 
   /** Complete the connection by accepting the answer (caller side). */
   async acceptAnswer(answerStr: string): Promise<void> {
-    const answer = JSON.parse(atob(answerStr));
+    const answer = JSON.parse(atob(answerStr)) as RTCSessionDescriptionInit;
     await this.pc.setRemoteDescription(answer);
   }
 
@@ -512,7 +509,7 @@ export class Peer {
       this.screenStream = null;
     }
 
-    this.renegotiate().catch(console.error);
+    this.renegotiate().catch(() => { /* peer may already be closed */ });
     this.sendDC({ type: "screen-stop" });
   }
 
