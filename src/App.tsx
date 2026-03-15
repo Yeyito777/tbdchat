@@ -3,17 +3,66 @@ import { Peer } from "./peer";
 import { initIdentity, getShortId } from "./identity";
 import { getFriends, addFriend, removeFriend, getFriend } from "./friends";
 import type { Friend } from "./friends";
+import { saveMessage, getMessages } from "./messages";
+import type { Message } from "./messages";
 
-type Message = { from: "me" | "them"; text: string; ts: number };
+type ChatMessage = { from: "me" | "them"; text: string; ts: number };
 type Stage = "home" | "creating" | "create-waiting" | "join-waiting" | "chat";
 type SidebarView = "list" | "friend-detail";
 type CallState = "idle" | "calling" | "ringing" | "in-call";
+
+/* ── helpers ─────────────────────────────────────────── */
+
+const URL_RE = /https?:\/\/[^\s<>"']+/g;
+
+function formatTime(ts: number): string {
+  const d = new Date(ts);
+  return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0");
+}
+
+function dayKey(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+function formatDayLabel(ts: number): string {
+  const d = new Date(ts);
+  const now = new Date();
+  if (dayKey(ts) === dayKey(Date.now())) return "Today";
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (dayKey(ts) === dayKey(yesterday.getTime())) return "Yesterday";
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: d.getFullYear() !== now.getFullYear() ? "numeric" : undefined });
+}
+
+function renderMessageText(text: string): React.ReactNode {
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  const regex = new RegExp(URL_RE.source, "g");
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.slice(lastIndex, match.index));
+    }
+    const url = match[0];
+    parts.push(
+      <a key={match.index} href={url} target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa", textDecoration: "underline", wordBreak: "break-all" }}>
+        {url}
+      </a>,
+    );
+    lastIndex = match.index + url.length;
+  }
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  return parts.length === 1 ? parts[0] : parts;
+}
+
+/* ── component ───────────────────────────────────────── */
 
 export default function App() {
   const [ready, setReady] = useState(false);
   const [shortId, setShortId] = useState("");
   const [stage, setStage] = useState<Stage>("home");
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [offerText, setOfferText] = useState("");
   const [pasteText, setPasteText] = useState("");
@@ -26,6 +75,9 @@ export default function App() {
   const [showSavePrompt, setShowSavePrompt] = useState(false);
   const [friendName, setFriendName] = useState("");
   const [connectedPeerId, setConnectedPeerId] = useState<string | null>(null);
+
+  // Sidebar preview: friendId -> { lastText, lastTs, count }
+  const [friendPreviews, setFriendPreviews] = useState<Record<string, { lastText: string; lastTs: number; count: number }>>({});
 
   // Call state
   const [callState, setCallState] = useState<CallState>("idle");
@@ -41,6 +93,7 @@ export default function App() {
 
   const peerRef = useRef<Peer | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Init identity on mount
   useEffect(() => {
@@ -50,6 +103,34 @@ export default function App() {
       setReady(true);
     });
   }, []);
+
+  // Load friend previews on mount and whenever friends change
+  useEffect(() => {
+    if (!ready) return;
+    const loadPreviews = async () => {
+      const fl = getFriends();
+      const previews: Record<string, { lastText: string; lastTs: number; count: number }> = {};
+      for (const f of fl) {
+        const msgs = await getMessages(f.id);
+        if (msgs.length > 0) {
+          const last = msgs[msgs.length - 1];
+          previews[f.id] = { lastText: last.text, lastTs: last.ts, count: msgs.length };
+        }
+      }
+      setFriendPreviews(previews);
+    };
+    loadPreviews();
+  }, [ready, friends]);
+
+  // Load message history when we connect to a peer
+  useEffect(() => {
+    if (stage === "chat" && connectedPeerId) {
+      getMessages(connectedPeerId).then((stored) => {
+        const chat: ChatMessage[] = stored.map((m) => ({ from: m.from, text: m.text, ts: m.ts }));
+        setMessages(chat);
+      });
+    }
+  }, [stage, connectedPeerId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -106,10 +187,29 @@ export default function App() {
     setRemoteStream(null);
   }
 
+  /* persist a message to IndexedDB + update sidebar preview */
+  function persistMessage(friendId: string, from: "me" | "them", text: string, ts: number) {
+    const msg: Message = { id: crypto.randomUUID(), friendId, from, text, ts };
+    saveMessage(msg);
+    setFriendPreviews((prev) => ({
+      ...prev,
+      [friendId]: {
+        lastText: text,
+        lastTs: ts,
+        count: (prev[friendId]?.count ?? 0) + 1,
+      },
+    }));
+  }
+
   function makePeer() {
     const peer = new Peer({
-      onMessage: (text) =>
-        setMessages((m) => [...m, { from: "them", text, ts: Date.now() }]),
+      onMessage: (text) => {
+        const ts = Date.now();
+        setMessages((m) => [...m, { from: "them", text, ts }]);
+        // persist – use a ref to get the latest connectedPeerId
+        const fid = peerRef.current ? connectedPeerIdRef.current : null;
+        if (fid) persistMessage(fid, "them", text, ts);
+      },
       onConnected: () => setStage("chat"),
       onDisconnected: () => {
         setStage("home");
@@ -126,6 +226,7 @@ export default function App() {
       onIdentity: (id) => {
         setRemoteShortId(id);
         setConnectedPeerId(id);
+        connectedPeerIdRef.current = id;
         if (!getFriend(id)) {
           setShowSavePrompt(true);
         }
@@ -155,6 +256,12 @@ export default function App() {
     return peer;
   }
 
+  // Keep a ref for connectedPeerId so the onMessage callback always reads latest
+  const connectedPeerIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    connectedPeerIdRef.current = connectedPeerId;
+  }, [connectedPeerId]);
+
   // --- CALLER FLOW ---
   async function handleCreate() {
     setStage("creating");
@@ -183,9 +290,16 @@ export default function App() {
   // --- CHAT ---
   function handleSend() {
     if (!input.trim() || !peerRef.current) return;
-    peerRef.current.send(input.trim());
-    setMessages((m) => [...m, { from: "me", text: input.trim(), ts: Date.now() }]);
+    const text = input.trim();
+    const ts = Date.now();
+    peerRef.current.send(text);
+    setMessages((m) => [...m, { from: "me", text, ts }]);
+    if (connectedPeerId) persistMessage(connectedPeerId, "me", text, ts);
     setInput("");
+    // Reset textarea height
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+    }
   }
 
   function copyToClipboard(text: string) {
@@ -252,7 +366,7 @@ export default function App() {
     } catch (err) {
       setCallState("idle");
       setCallError(
-        err instanceof Error ? err.message : "Could not access microphone"
+        err instanceof Error ? err.message : "Could not access microphone",
       );
     }
   }
@@ -267,7 +381,7 @@ export default function App() {
       setCallState("idle");
       peerRef.current.rejectCall();
       setCallError(
-        err instanceof Error ? err.message : "Could not access microphone"
+        err instanceof Error ? err.message : "Could not access microphone",
       );
     }
   }
@@ -297,7 +411,6 @@ export default function App() {
       await peerRef.current.startScreenShare();
       setScreenSharing(true);
     } catch (err) {
-      // User cancelled or browser denied — not an error worth persisting
       console.warn("Screen share failed:", err);
     }
   }
@@ -312,6 +425,23 @@ export default function App() {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return `${m}:${s.toString().padStart(2, "0")}`;
+  }
+
+  /* textarea auto-grow */
+  function handleTextareaInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    setInput(e.target.value);
+    const el = e.target;
+    el.style.height = "auto";
+    const lineHeight = 22;
+    const maxHeight = lineHeight * 4 + 20; // 4 lines + padding
+    el.style.height = Math.min(el.scrollHeight, maxHeight) + "px";
+  }
+
+  function handleTextareaKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
   }
 
   if (!ready) return null;
@@ -338,6 +468,7 @@ export default function App() {
         {friends.map((f) => {
           const isOnline = connectedPeerId === f.id;
           const isSelected = selectedFriendId === f.id;
+          const preview = friendPreviews[f.id];
           return (
             <div
               key={f.id}
@@ -354,8 +485,24 @@ export default function App() {
                 }}
               />
               <div style={s.friendInfo}>
-                <div style={s.friendName}>{f.name}</div>
-                <div style={s.friendId}>{f.id}</div>
+                <div style={s.friendNameRow}>
+                  <span style={s.friendName}>{f.name}</span>
+                  {preview && (
+                    <span style={s.friendTime}>{formatTime(preview.lastTs)}</span>
+                  )}
+                </div>
+                <div style={s.friendPreviewRow}>
+                  {preview ? (
+                    <span style={s.friendPreview}>
+                      {preview.lastText.length > 30 ? preview.lastText.slice(0, 30) + "…" : preview.lastText}
+                    </span>
+                  ) : (
+                    <span style={s.friendId}>{f.id}</span>
+                  )}
+                  {preview && preview.count > 0 && (
+                    <span style={s.friendMsgCount}>{preview.count}</span>
+                  )}
+                </div>
               </div>
             </div>
           );
@@ -414,6 +561,53 @@ export default function App() {
     <div style={s.callErrorBar}>⚠️ {callError}</div>
   ) : null;
 
+  // --- MESSAGES with date separators ---
+  function renderMessages() {
+    const nodes: React.ReactNode[] = [];
+    let lastDay = "";
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const dk = dayKey(m.ts);
+      if (dk !== lastDay) {
+        lastDay = dk;
+        nodes.push(
+          <div key={`sep-${dk}`} style={s.dateSeparator}>
+            <div style={s.dateLine} />
+            <span style={s.dateLabel}>{formatDayLabel(m.ts)}</span>
+            <div style={s.dateLine} />
+          </div>,
+        );
+      }
+      nodes.push(
+        <div
+          key={i}
+          style={{
+            alignSelf: m.from === "me" ? "flex-end" : "flex-start",
+            maxWidth: "70%",
+          }}
+        >
+          <div
+            style={{
+              ...s.bubble,
+              background: m.from === "me" ? "#2563eb" : "#262626",
+            }}
+          >
+            {renderMessageText(m.text)}
+          </div>
+          <div
+            style={{
+              ...s.timestamp,
+              textAlign: m.from === "me" ? "right" : "left",
+            }}
+          >
+            {formatTime(m.ts)}
+          </div>
+        </div>,
+      );
+    }
+    return nodes;
+  }
+
   // --- MAIN CONTENT ---
   let mainContent: React.ReactNode;
 
@@ -464,7 +658,7 @@ export default function App() {
           </button>
           <div style={s.divider}>or join with a code</div>
           <textarea
-            style={s.textarea}
+            style={s.inviteTextarea}
             placeholder="Paste invite code here..."
             value={pasteText}
             onChange={(e) => setPasteText(e.target.value)}
@@ -498,7 +692,7 @@ export default function App() {
           Step 2: Paste their response code
         </p>
         <textarea
-          style={s.textarea}
+          style={s.inviteTextarea}
           placeholder="Paste their response code here..."
           value={pasteText}
           onChange={(e) => setPasteText(e.target.value)}
@@ -604,38 +798,23 @@ export default function App() {
           </div>
         )}
         <div style={s.chatMessages}>
-          {messages.map((m, i) => (
-            <div
-              key={i}
-              style={{
-                ...s.bubble,
-                alignSelf: m.from === "me" ? "flex-end" : "flex-start",
-                background: m.from === "me" ? "#2563eb" : "#262626",
-              }}
-            >
-              {m.text}
-            </div>
-          ))}
+          {renderMessages()}
           <div ref={bottomRef} />
         </div>
-        <form
-          style={s.chatInput}
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSend();
-          }}
-        >
-          <input
-            style={s.input}
+        <div style={s.chatInput}>
+          <textarea
+            ref={textareaRef}
+            style={s.msgTextarea}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Type a message..."
-            autoFocus
+            onChange={handleTextareaInput}
+            onKeyDown={handleTextareaKeyDown}
+            placeholder="Type a message... (Shift+Enter for new line)"
+            rows={1}
           />
-          <button style={s.sendBtn} type="submit">
+          <button style={s.sendBtn} onClick={handleSend}>
             Send
           </button>
-        </form>
+        </div>
       </div>
     );
   }
@@ -722,6 +901,13 @@ const s: Record<string, React.CSSProperties> = {
   },
   friendInfo: {
     minWidth: 0,
+    flex: 1,
+  },
+  friendNameRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+    gap: 4,
   },
   friendName: {
     fontSize: 14,
@@ -729,6 +915,33 @@ const s: Record<string, React.CSSProperties> = {
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
+  },
+  friendTime: {
+    fontSize: 10,
+    color: "#555",
+    flexShrink: 0,
+  },
+  friendPreviewRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 4,
+    marginTop: 1,
+  },
+  friendPreview: {
+    fontSize: 12,
+    color: "#666",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  friendMsgCount: {
+    fontSize: 10,
+    color: "#888",
+    background: "#2a2a2a",
+    borderRadius: 8,
+    padding: "1px 5px",
+    flexShrink: 0,
   },
   friendId: {
     fontSize: 11,
@@ -793,7 +1006,7 @@ const s: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     flexShrink: 0,
   },
-  textarea: {
+  inviteTextarea: {
     width: "100%",
     maxWidth: 400,
     minHeight: 80,
@@ -962,23 +1175,47 @@ const s: Record<string, React.CSSProperties> = {
     padding: 16,
     display: "flex",
     flexDirection: "column",
-    gap: 8,
+    gap: 4,
   },
   bubble: {
     padding: "8px 14px",
     borderRadius: 16,
-    maxWidth: "70%",
     fontSize: 15,
     lineHeight: 1.4,
     wordBreak: "break-word",
+    whiteSpace: "pre-wrap",
+  },
+  timestamp: {
+    fontSize: 11,
+    color: "#666",
+    marginTop: 2,
+    padding: "0 4px",
+  },
+  dateSeparator: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    margin: "12px 0 8px",
+  },
+  dateLine: {
+    flex: 1,
+    height: 1,
+    background: "#333",
+  },
+  dateLabel: {
+    fontSize: 12,
+    color: "#666",
+    whiteSpace: "nowrap",
+    flexShrink: 0,
   },
   chatInput: {
     display: "flex",
     gap: 8,
     padding: 12,
     borderTop: "1px solid #222",
+    alignItems: "flex-end",
   },
-  input: {
+  msgTextarea: {
     flex: 1,
     padding: "10px 14px",
     background: "#161616",
@@ -987,6 +1224,11 @@ const s: Record<string, React.CSSProperties> = {
     borderRadius: 8,
     fontSize: 15,
     outline: "none",
+    resize: "none",
+    lineHeight: "22px",
+    maxHeight: 108, // ~4 lines (22*4 + 20 padding)
+    overflow: "auto",
+    fontFamily: "inherit",
   },
   sendBtn: {
     padding: "10px 20px",
@@ -997,6 +1239,8 @@ const s: Record<string, React.CSSProperties> = {
     fontSize: 15,
     fontWeight: 600,
     cursor: "pointer",
+    flexShrink: 0,
+    alignSelf: "flex-end",
   },
   friendDetailCard: {
     background: "#161616",
