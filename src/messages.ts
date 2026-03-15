@@ -8,6 +8,9 @@ export type Message = {
   from: "me" | "them";
   text: string;
   ts: number;
+  /** Present for file-transfer messages (name+size only, no blob). */
+  fileName?: string;
+  fileSize?: number;
 };
 
 const DB_NAME = "tbdchat-messages";

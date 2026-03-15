@@ -1,12 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Peer } from "./peer";
+import { Peer, MAX_FILE_SIZE } from "./peer";
 import { initIdentity, getShortId } from "./identity";
 import { getFriends, addFriend, removeFriend, getFriend } from "./friends";
 import type { Friend } from "./friends";
 import { saveMessage, getMessages } from "./messages";
 import type { Message } from "./messages";
 
-type ChatMessage = { from: "me" | "them"; text: string; ts: number };
+type FileInfo = { name: string; size: number; url?: string; fileId: string };
+type ChatMessage = { from: "me" | "them"; ts: number; text?: string; file?: FileInfo };
 type Stage = "home" | "creating" | "create-waiting" | "join-waiting" | "chat";
 type SidebarView = "list" | "friend-detail";
 type CallState = "idle" | "calling" | "ringing" | "in-call";
@@ -33,6 +34,13 @@ function formatDayLabel(ts: number): string {
   yesterday.setDate(now.getDate() - 1);
   if (dayKey(ts) === dayKey(yesterday.getTime())) return "Yesterday";
   return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: d.getFullYear() !== now.getFullYear() ? "numeric" : undefined });
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
 }
 
 function renderMessageText(text: string): React.ReactNode {
@@ -91,6 +99,13 @@ export default function App() {
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
+  // File transfer state
+  const [fileProgress, setFileProgress] = useState<Map<string, { received: number; total: number }>>(new Map());
+  const [dragging, setDragging] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const dragCounter = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const peerRef = useRef<Peer | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -126,7 +141,12 @@ export default function App() {
   useEffect(() => {
     if (stage === "chat" && connectedPeerId) {
       getMessages(connectedPeerId).then((stored) => {
-        const chat: ChatMessage[] = stored.map((m) => ({ from: m.from, text: m.text, ts: m.ts }));
+        const chat: ChatMessage[] = stored.map((m) => {
+          if (m.fileName && m.fileSize != null) {
+            return { from: m.from, file: { name: m.fileName, size: m.fileSize, fileId: m.id }, ts: m.ts };
+          }
+          return { from: m.from, text: m.text, ts: m.ts };
+        });
         setMessages(chat);
       });
     }
@@ -172,6 +192,13 @@ export default function App() {
     return () => clearTimeout(t);
   }, [callError]);
 
+  // Clear file error after 4 seconds
+  useEffect(() => {
+    if (!fileError) return;
+    const t = setTimeout(() => setFileError(null), 4000);
+    return () => clearTimeout(t);
+  }, [fileError]);
+
   const refreshFriends = useCallback(() => {
     setFriends(getFriends());
   }, []);
@@ -187,7 +214,7 @@ export default function App() {
     setRemoteStream(null);
   }
 
-  /* persist a message to IndexedDB + update sidebar preview */
+  /* persist a text message to IndexedDB + update sidebar preview */
   function persistMessage(friendId: string, from: "me" | "them", text: string, ts: number) {
     const msg: Message = { id: crypto.randomUUID(), friendId, from, text, ts };
     saveMessage(msg);
@@ -195,6 +222,21 @@ export default function App() {
       ...prev,
       [friendId]: {
         lastText: text,
+        lastTs: ts,
+        count: (prev[friendId]?.count ?? 0) + 1,
+      },
+    }));
+  }
+
+  /* persist a file message to IndexedDB (name+size only, no blob) */
+  function persistFileMessage(friendId: string, from: "me" | "them", fileName: string, fileSize: number, ts: number) {
+    const previewText = `📎 ${fileName}`;
+    const msg: Message = { id: crypto.randomUUID(), friendId, from, text: previewText, ts, fileName, fileSize };
+    saveMessage(msg);
+    setFriendPreviews((prev) => ({
+      ...prev,
+      [friendId]: {
+        lastText: previewText,
         lastTs: ts,
         count: (prev[friendId]?.count ?? 0) + 1,
       },
@@ -218,6 +260,7 @@ export default function App() {
         setShowSavePrompt(false);
         resetCallState();
         resetScreenState();
+        setFileProgress(new Map());
         peerRef.current = null;
       },
       onChannelOpen: () => {
@@ -249,6 +292,41 @@ export default function App() {
       },
       onRemoteStream: (stream) => {
         setRemoteStream(stream);
+      },
+
+      // ── File transfer callbacks ─────────────────────────
+      onFileStart: (meta) => {
+        const ts = Date.now();
+        setMessages((m) => [
+          ...m,
+          { from: "them", file: { name: meta.name, size: meta.size, fileId: meta.fileId }, ts },
+        ]);
+        setFileProgress((prev) => new Map(prev).set(meta.fileId, { received: 0, total: meta.size }));
+      },
+      onFileProgress: (fileId, received, total) => {
+        setFileProgress((prev) => new Map(prev).set(fileId, { received, total }));
+      },
+      onFileReceived: (file) => {
+        // Update the in-memory message with the object URL
+        setMessages((msgs) =>
+          msgs.map((m) => {
+            if (m.file?.fileId === file.fileId) {
+              return { ...m, file: { ...m.file, url: file.url } };
+            }
+            return m;
+          }),
+        );
+        // Remove from progress tracking
+        setFileProgress((prev) => {
+          const next = new Map(prev);
+          next.delete(file.fileId);
+          return next;
+        });
+        // Persist to IndexedDB
+        const fid = connectedPeerIdRef.current;
+        if (fid) {
+          persistFileMessage(fid, "them", file.name, file.size, Date.now());
+        }
       },
     });
     peer.setLocalShortId(getShortId());
@@ -348,6 +426,7 @@ export default function App() {
       setShowSavePrompt(false);
       resetCallState();
       resetScreenState();
+      setFileProgress(new Map());
     } else {
       setStage("home");
       setOfferText("");
@@ -419,6 +498,96 @@ export default function App() {
     if (!peerRef.current) return;
     peerRef.current.stopScreenShare();
     setScreenSharing(false);
+  }
+
+  // --- FILE TRANSFER ACTIONS ---
+  async function handleFileSend(file: File) {
+    if (!peerRef.current) return;
+    if (file.size > MAX_FILE_SIZE) {
+      setFileError(`File too large (${formatFileSize(file.size)}). Max 100 MB.`);
+      return;
+    }
+    if (file.size === 0) {
+      setFileError("Cannot send an empty file.");
+      return;
+    }
+
+    const fileId = crypto.randomUUID();
+    const ts = Date.now();
+    const url = URL.createObjectURL(file);
+
+    // Add to chat immediately (with local object URL for re-download)
+    setMessages((m) => [
+      ...m,
+      { from: "me", file: { name: file.name, size: file.size, url, fileId }, ts },
+    ]);
+
+    // Persist metadata
+    if (connectedPeerId) {
+      persistFileMessage(connectedPeerId, "me", file.name, file.size, ts);
+    }
+
+    // Start transfer with progress
+    setFileProgress((prev) => new Map(prev).set(fileId, { received: 0, total: file.size }));
+
+    try {
+      await peerRef.current.sendFile(file, fileId);
+    } catch (err) {
+      console.error("File send failed:", err);
+      setFileError(err instanceof Error ? err.message : "File send failed");
+    }
+
+    // Transfer complete — remove progress entry
+    setFileProgress((prev) => {
+      const next = new Map(prev);
+      next.delete(fileId);
+      return next;
+    });
+  }
+
+  // Drag-and-drop handlers
+  function handleDragEnter(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current++;
+    if (e.dataTransfer.types.includes("Files")) {
+      setDragging(true);
+    }
+  }
+
+  function handleDragLeave(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current--;
+    if (dragCounter.current === 0) {
+      setDragging(false);
+    }
+  }
+
+  function handleDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragging(false);
+    dragCounter.current = 0;
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+      handleFileSend(files[0]);
+    }
+  }
+
+  function handleFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (file) {
+      handleFileSend(file);
+    }
+    // Reset so the same file can be re-sent
+    e.target.value = "";
   }
 
   function formatDuration(seconds: number): string {
@@ -561,6 +730,11 @@ export default function App() {
     <div style={s.callErrorBar}>⚠️ {callError}</div>
   ) : null;
 
+  // --- FILE ERROR ---
+  const fileErrorBar = fileError ? (
+    <div style={s.fileErrorBar}>⚠️ {fileError}</div>
+  ) : null;
+
   // --- MESSAGES with date separators ---
   function renderMessages() {
     const nodes: React.ReactNode[] = [];
@@ -578,32 +752,92 @@ export default function App() {
           </div>,
         );
       }
-      nodes.push(
-        <div
-          key={i}
-          style={{
-            alignSelf: m.from === "me" ? "flex-end" : "flex-start",
-            maxWidth: "70%",
-          }}
-        >
+
+      if (m.file) {
+        // ── File message bubble ────────────────────────
+        const progress = fileProgress.get(m.file.fileId);
+        const isTransferring = !!progress;
+        const pct = progress ? Math.round((progress.received / progress.total) * 100) : 0;
+
+        nodes.push(
           <div
+            key={i}
             style={{
-              ...s.bubble,
-              background: m.from === "me" ? "#2563eb" : "#262626",
+              alignSelf: m.from === "me" ? "flex-end" : "flex-start",
+              maxWidth: "70%",
             }}
           >
-            {renderMessageText(m.text)}
-          </div>
+            <div
+              style={{
+                ...s.fileBubble,
+                background: m.from === "me" ? "#1e3a5f" : "#262626",
+              }}
+            >
+              <div style={s.fileIcon}>📎</div>
+              <div style={s.fileDetails}>
+                <div style={s.fileName}>{m.file.name}</div>
+                <div style={s.fileSizeText}>{formatFileSize(m.file.size)}</div>
+                {isTransferring && (
+                  <>
+                    <div style={s.progressContainer}>
+                      <div style={{ ...s.progressBar, width: `${pct}%` }} />
+                    </div>
+                    <div style={s.progressText}>{pct}%</div>
+                  </>
+                )}
+                {m.file.url && !isTransferring && (
+                  <a
+                    href={m.file.url}
+                    download={m.file.name}
+                    style={s.downloadLink}
+                  >
+                    Download
+                  </a>
+                )}
+                {!m.file.url && !isTransferring && (
+                  <div style={s.fileExpired}>File not available</div>
+                )}
+              </div>
+            </div>
+            <div
+              style={{
+                ...s.timestamp,
+                textAlign: m.from === "me" ? "right" : "left",
+              }}
+            >
+              {formatTime(m.ts)}
+            </div>
+          </div>,
+        );
+      } else {
+        // ── Text message bubble ────────────────────────
+        nodes.push(
           <div
+            key={i}
             style={{
-              ...s.timestamp,
-              textAlign: m.from === "me" ? "right" : "left",
+              alignSelf: m.from === "me" ? "flex-end" : "flex-start",
+              maxWidth: "70%",
             }}
           >
-            {formatTime(m.ts)}
-          </div>
-        </div>,
-      );
+            <div
+              style={{
+                ...s.bubble,
+                background: m.from === "me" ? "#2563eb" : "#262626",
+              }}
+            >
+              {renderMessageText(m.text ?? "")}
+            </div>
+            <div
+              style={{
+                ...s.timestamp,
+                textAlign: m.from === "me" ? "right" : "left",
+              }}
+            >
+              {formatTime(m.ts)}
+            </div>
+          </div>,
+        );
+      }
     }
     return nodes;
   }
@@ -762,6 +996,7 @@ export default function App() {
         </div>
         {callBar}
         {callErrorBar}
+        {fileErrorBar}
         {showSavePrompt && (
           <div style={s.savePrompt}>
             <span style={s.savePromptText}>
@@ -797,11 +1032,38 @@ export default function App() {
             />
           </div>
         )}
-        <div style={s.chatMessages}>
-          {renderMessages()}
-          <div ref={bottomRef} />
+        {/* Chat messages area with drag-and-drop */}
+        <div
+          style={s.chatMessagesWrapper}
+          onDragEnter={handleDragEnter}
+          onDragLeave={handleDragLeave}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+        >
+          <div style={s.chatMessages}>
+            {renderMessages()}
+            <div ref={bottomRef} />
+          </div>
+          {dragging && (
+            <div style={s.dropOverlay}>
+              <div style={s.dropOverlayText}>📎 Drop file to send</div>
+            </div>
+          )}
         </div>
         <div style={s.chatInput}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            style={{ display: "none" }}
+            onChange={handleFileInputChange}
+          />
+          <button
+            style={s.attachBtn}
+            onClick={() => fileInputRef.current?.click()}
+            title="Send file (max 100 MB)"
+          >
+            📎
+          </button>
           <textarea
             ref={textareaRef}
             style={s.msgTextarea}
@@ -1132,6 +1394,13 @@ const s: Record<string, React.CSSProperties> = {
     fontSize: 13,
     color: "#f87171",
   },
+  fileErrorBar: {
+    padding: "6px 16px",
+    background: "#2a1a1a",
+    borderBottom: "1px solid #442222",
+    fontSize: 13,
+    color: "#f87171",
+  },
   savePrompt: {
     display: "flex",
     alignItems: "center",
@@ -1168,6 +1437,14 @@ const s: Record<string, React.CSSProperties> = {
     maxHeight: "60vh",
     background: "#000",
     display: "block",
+  },
+  // Wrapper for chat messages + drop overlay
+  chatMessagesWrapper: {
+    position: "relative",
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
   },
   chatMessages: {
     flex: 1,
@@ -1242,6 +1519,97 @@ const s: Record<string, React.CSSProperties> = {
     flexShrink: 0,
     alignSelf: "flex-end",
   },
+  attachBtn: {
+    padding: "10px 12px",
+    background: "none",
+    border: "1px solid #333",
+    borderRadius: 8,
+    fontSize: 18,
+    cursor: "pointer",
+    lineHeight: 1,
+    flexShrink: 0,
+    alignSelf: "flex-end",
+  },
+  // ── File message bubble styles ────────────────────────
+  fileBubble: {
+    padding: "10px 14px",
+    borderRadius: 16,
+    display: "flex",
+    alignItems: "flex-start",
+    gap: 10,
+    minWidth: 200,
+  },
+  fileIcon: {
+    fontSize: 24,
+    lineHeight: 1,
+    flexShrink: 0,
+  },
+  fileDetails: {
+    flex: 1,
+    minWidth: 0,
+  },
+  fileName: {
+    fontSize: 14,
+    fontWeight: 600,
+    wordBreak: "break-all",
+    color: "#e0e0e0",
+  },
+  fileSizeText: {
+    fontSize: 12,
+    color: "#999",
+    marginTop: 2,
+  },
+  progressContainer: {
+    marginTop: 6,
+    height: 4,
+    background: "#444",
+    borderRadius: 2,
+    overflow: "hidden",
+  },
+  progressBar: {
+    height: "100%",
+    background: "#2563eb",
+    borderRadius: 2,
+    transition: "width 0.15s ease",
+  },
+  progressText: {
+    fontSize: 11,
+    color: "#999",
+    marginTop: 2,
+  },
+  downloadLink: {
+    display: "inline-block",
+    marginTop: 6,
+    fontSize: 13,
+    color: "#60a5fa",
+    textDecoration: "none",
+    fontWeight: 500,
+  },
+  fileExpired: {
+    fontSize: 12,
+    color: "#666",
+    fontStyle: "italic",
+    marginTop: 4,
+  },
+  // ── Drop overlay ──────────────────────────────────────
+  dropOverlay: {
+    position: "absolute",
+    inset: 0,
+    background: "rgba(37, 99, 235, 0.12)",
+    border: "2px dashed #2563eb",
+    borderRadius: 8,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 10,
+    pointerEvents: "none",
+  },
+  dropOverlayText: {
+    color: "#60a5fa",
+    fontSize: 18,
+    fontWeight: 600,
+  },
+  // ── Friend detail ─────────────────────────────────────
   friendDetailCard: {
     background: "#161616",
     border: "1px solid #222",

@@ -1,7 +1,7 @@
 /**
  * Minimal WebRTC peer connection manager.
  * Handles offer/answer exchange, DataChannel messaging, identity exchange,
- * and 1:1 voice calls over the same peer connection.
+ * 1:1 voice calls, screen sharing, and file transfers over the same peer connection.
  */
 
 const ICE_SERVERS: RTCConfiguration = {
@@ -10,6 +10,12 @@ const ICE_SERVERS: RTCConfiguration = {
     { urls: "stun:stun1.l.google.com:19302" },
   ],
 };
+
+/** Maximum file size allowed: 100 MB */
+export const MAX_FILE_SIZE = 100 * 1024 * 1024;
+
+const CHUNK_SIZE = 16384; // 16 KB
+const MAX_BUFFERED = 262144; // 256 KB – backpressure threshold
 
 /** Protocol messages sent over the DataChannel as JSON. */
 export type DCMessage =
@@ -21,7 +27,9 @@ export type DCMessage =
   | { type: "screen-start" }
   | { type: "screen-stop" }
   | { type: "_renego-offer"; sdp: RTCSessionDescriptionInit }
-  | { type: "_renego-answer"; sdp: RTCSessionDescriptionInit };
+  | { type: "_renego-answer"; sdp: RTCSessionDescriptionInit }
+  | { type: "file-meta"; name: string; size: number; fileId: string }
+  | { type: "file-done"; fileId: string };
 
 export type PeerEvents = {
   onMessage: (msg: string) => void;
@@ -35,6 +43,12 @@ export type PeerEvents = {
   onScreenStart?: () => void;
   onScreenStop?: () => void;
   onRemoteStream?: (stream: MediaStream | null) => void;
+  /** Fired when a remote file transfer begins (file-meta received). */
+  onFileStart?: (meta: { name: string; size: number; fileId: string }) => void;
+  /** Fired when a file transfer completes and the Blob is ready. */
+  onFileReceived?: (file: { name: string; size: number; url: string; fileId: string }) => void;
+  /** Fired on every chunk (send or receive) so the UI can draw a progress bar. */
+  onFileProgress?: (fileId: string, received: number, total: number) => void;
 };
 
 export class Peer {
@@ -53,6 +67,15 @@ export class Peer {
   private screenStream: MediaStream | null = null;
   private screenSenders: RTCRtpSender[] = [];
   private remoteVideoStream: MediaStream | null = null;
+
+  // Incoming file transfer state
+  private _incomingFile: {
+    fileId: string;
+    name: string;
+    size: number;
+    chunks: ArrayBuffer[];
+    received: number;
+  } | null = null;
 
   constructor(events: PeerEvents) {
     this.events = events;
@@ -117,6 +140,10 @@ export class Peer {
 
   private setupChannel() {
     if (!this.dc) return;
+
+    // Enable ArrayBuffer reception for binary file chunks
+    this.dc.binaryType = "arraybuffer";
+
     this.dc.onopen = () => {
       this.events.onChannelOpen?.();
       // Send identity message
@@ -124,7 +151,15 @@ export class Peer {
         this.sendDC({ type: "identity", shortId: this._localShortId });
       }
     };
+
     this.dc.onmessage = (e) => {
+      // ── Binary data → file chunk ──────────────────────────
+      if (e.data instanceof ArrayBuffer) {
+        this.handleFileChunk(e.data);
+        return;
+      }
+
+      // ── JSON protocol messages ────────────────────────────
       let parsed: Record<string, unknown> | null = null;
       try {
         parsed = JSON.parse(e.data) as Record<string, unknown>;
@@ -174,8 +209,50 @@ export class Peer {
         case "_renego-answer":
           this.pc.setRemoteDescription(parsed.sdp as RTCSessionDescriptionInit).catch(console.error);
           break;
+
+        // ── File transfer protocol ────────────────────────
+        case "file-meta":
+          this._incomingFile = {
+            fileId: parsed.fileId as string,
+            name: parsed.name as string,
+            size: parsed.size as number,
+            chunks: [],
+            received: 0,
+          };
+          this.events.onFileStart?.({
+            name: parsed.name as string,
+            size: parsed.size as number,
+            fileId: parsed.fileId as string,
+          });
+          this.events.onFileProgress?.(parsed.fileId as string, 0, parsed.size as number);
+          break;
+        case "file-done":
+          if (this._incomingFile && this._incomingFile.fileId === parsed.fileId) {
+            const blob = new Blob(this._incomingFile.chunks);
+            const url = URL.createObjectURL(blob);
+            this.events.onFileReceived?.({
+              name: this._incomingFile.name,
+              size: this._incomingFile.size,
+              url,
+              fileId: this._incomingFile.fileId,
+            });
+            this._incomingFile = null;
+          }
+          break;
       }
     };
+  }
+
+  /** Buffer an incoming binary chunk for the current file transfer. */
+  private handleFileChunk(data: ArrayBuffer) {
+    if (!this._incomingFile) return;
+    this._incomingFile.chunks.push(data);
+    this._incomingFile.received += data.byteLength;
+    this.events.onFileProgress?.(
+      this._incomingFile.fileId,
+      this._incomingFile.received,
+      this._incomingFile.size,
+    );
   }
 
   /** Handle a renegotiation offer from the remote side. */
@@ -234,6 +311,60 @@ export class Peer {
   /** Send a text message over the data channel (wrapped in chat protocol). */
   send(msg: string) {
     this.sendDC({ type: "chat", text: msg });
+  }
+
+  // ─── File transfer methods ──────────────────────────────────────
+
+  /**
+   * Send a file over the data channel.
+   * Protocol: file-meta (JSON) → N binary chunks → file-done (JSON).
+   * Applies backpressure via bufferedAmount polling.
+   */
+  async sendFile(file: File, fileId: string): Promise<void> {
+    const dc = this.dc;
+    if (!dc || dc.readyState !== "open") {
+      throw new Error("Data channel not open");
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      throw new Error("File too large (max 100 MB)");
+    }
+
+    // 1. Send metadata
+    this.sendDC({ type: "file-meta", name: file.name, size: file.size, fileId });
+
+    // 2. Read file into memory and send in chunks
+    const buffer = await file.arrayBuffer();
+    let offset = 0;
+
+    while (offset < buffer.byteLength) {
+      // Backpressure: wait if the DC send-buffer is too full
+      if (dc.bufferedAmount > MAX_BUFFERED) {
+        await new Promise<void>((resolve) => {
+          const check = () => {
+            if (!dc || dc.readyState !== "open") {
+              resolve(); // will error on next send
+              return;
+            }
+            if (dc.bufferedAmount <= MAX_BUFFERED) {
+              resolve();
+            } else {
+              setTimeout(check, 5);
+            }
+          };
+          setTimeout(check, 5);
+        });
+      }
+
+      const end = Math.min(offset + CHUNK_SIZE, buffer.byteLength);
+      dc.send(buffer.slice(offset, end));
+      offset = end;
+
+      // Fire progress for the sender side
+      this.events.onFileProgress?.(fileId, offset, file.size);
+    }
+
+    // 3. Signal completion
+    this.sendDC({ type: "file-done", fileId });
   }
 
   // ─── Voice call methods ───────────────────────────────────────────
@@ -415,6 +546,7 @@ export class Peer {
   destroy() {
     this.cleanupCall();
     this.cleanupScreenShare();
+    this._incomingFile = null;
     this.dc?.close();
     this.pc.close();
   }
