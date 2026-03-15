@@ -38,6 +38,7 @@ export default function App() {
     const peer = makePeer();
     const offer = await peer.createOffer();
     setOfferText(offer);
+    (window as any).__tbdOffer = offer;
     setStage("create-waiting");
   }
 
@@ -53,6 +54,7 @@ export default function App() {
     const peer = makePeer();
     const answer = await peer.acceptOffer(pasteText.trim());
     setAnswerText(answer);
+    (window as any).__tbdAnswer = answer;
     setPasteText("");
     setStage("join-waiting");
   }
@@ -102,7 +104,7 @@ export default function App() {
         <h1 style={styles.title}>tbdchat</h1>
         <p style={styles.subtitle}>Step 1: Send this invite code to your friend</p>
         <div style={styles.codeBox}>
-          <code style={styles.code}>{offerText.slice(0, 80)}...</code>
+          <code style={styles.code} data-full={offerText}>{offerText.slice(0, 80)}...</code>
           <button style={styles.btnSmall} onClick={() => copyToClipboard(offerText)}>
             {copied ? "Copied!" : "Copy"}
           </button>
@@ -135,7 +137,7 @@ export default function App() {
           Send this response code back to your friend
         </p>
         <div style={styles.codeBox}>
-          <code style={styles.code}>{answerText.slice(0, 80)}...</code>
+          <code style={styles.code} data-full={answerText}>{answerText.slice(0, 80)}...</code>
           <button style={styles.btnSmall} onClick={() => copyToClipboard(answerText)}>
             {copied ? "Copied!" : "Copy"}
           </button>
